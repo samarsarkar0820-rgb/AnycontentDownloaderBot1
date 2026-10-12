@@ -1,0 +1,17 @@
+
+services:
+  - type: web
+    name: anycontent-downloader-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_USERNAME
+        sync: false
+      - key: TUTORIALS_URL
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"
