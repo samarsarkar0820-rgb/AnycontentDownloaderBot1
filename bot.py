@@ -1,269 +1,152 @@
-import os
-import re
-import uuid
-import shutil
-import logging
-import threading
-import subprocess
-from pathlib import Path
-from urllib.parse import urlparse
-
-import telebot
-import yt_dlp
+import os, re, glob, shutil, tempfile, subprocess, sys
+from threading import Thread
 from flask import Flask
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, InputMediaVideo
+import requests
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+import yt_dlp
 
-# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_USERNAME = os.getenv("OWNER_USERNAME", "YOUR_OWNER_USERNAME").strip().lstrip("@")
-TUTORIALS_URL = os.getenv("TUTORIALS_URL", "https://t.me/YOUR_TUTORIAL_CHANNEL").strip()
-CHANNEL_URL = "https://youtube.com/@bubiloworld_1m?feature=shared"
-CAPTION = "Downloaded Successfully! Power by: @AnycontentDownloaderbot"
-
-MAX_FILE_SIZE = 49 * 1024 * 1024
-MAX_MEDIA_PER_JOB = 10  # Telegram media groups allow up to 10 items
-DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "AnycontentDownloaderbot").strip().lstrip("@")
+TUTORIALS_URL = os.getenv("TUTORIALS_URL", "").strip()
+MAX_SEND_BYTES = 49 * 1024 * 1024
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+CHUNK = 1024 * 1024
+URL_RE = re.compile(r"https?://\S+", re.I)
 if not BOT_TOKEN:
-    raise RuntimeError("Please set the BOT_TOKEN environment variable.")
+    raise RuntimeError("Please set BOT_TOKEN in Render Environment Variables.")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
-download_slots = threading.Semaphore(2)
 
-ALLOWED_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be",
-    "instagram.com", "www.instagram.com", "m.instagram.com",
-    "facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com",
-    "fb.watch", "www.fb.watch",
-}
-
-# ---------------- WEB SERVICE ----------------
 @app.get("/")
 def home():
-    return "Anycontent Downloader Bot is running!", 200
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}, 200
+    return "Anycontent Downloader Bot is running", 200
 
 def keep_alive():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")), use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
 
-# ---------------- UI ----------------
-def main_keyboard():
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("📢 SUBSCRIBE CHANNEL", url=CHANNEL_URL),
-        InlineKeyboardButton("🎬 ALL TUTORIALS", url=TUTORIALS_URL),
-        InlineKeyboardButton("👨‍💻 CONTACT OWNER", url=f"https://t.me/{OWNER_USERNAME}")
-    )
-    return keyboard
+def buttons(url):
+    kb = InlineKeyboardMarkup()
+    ext = os.path.splitext(url.split("?", 1)[0])[1].lower()
+    direct_ext = {".zip",".rar",".7z",".pdf",".jpg",".jpeg",".png",".webp",".gif",".mp4",".mov",".mkv",".mp3",".wav",".apk",".doc",".docx",".xls",".xlsx",".ppt",".pptx",".txt",".csv",".epub",".webm"}
+    label = "⬇️ ফাইল ডাউনলোড করুন" if ext in direct_ext else "🔗 মূল লিংক খুলুন"
+    kb.add(InlineKeyboardButton(label, url=url))
+    return kb
 
-def extract_valid_url(text):
-    match = re.search(r"https?://[^\s<>]+", text or "")
-    if not match:
+def fallback(chat_id, url, reason):
+    bot.send_message(chat_id, f"⚠️ {reason}\n\nবট সরাসরি ফাইল পাঠাতে পারেনি। নিচের লিংকে চাপ দিয়ে মূল সাইট/ফাইল খুলে ডাউনলোডের চেষ্টা করো।", reply_markup=buttons(url), disable_web_page_preview=True)
+
+def safe_name(name):
+    name = os.path.basename(name or "download.bin")
+    name = re.sub(r'[\\\\/*?:"<>|]+', "_", name).strip(" .")
+    return (name or "download.bin")[:180]
+
+def direct_download(url, folder):
+    try:
+        with requests.get(url, stream=True, allow_redirects=True, timeout=(15, 45),
+                          headers={"User-Agent":"Mozilla/5.0"}) as r:
+            r.raise_for_status()
+            ctype = r.headers.get("Content-Type", "").lower()
+            final = r.url
+            if "text/html" in ctype:
+                return None
+            length = r.headers.get("Content-Length")
+            if length and int(length) > MAX_DOWNLOAD_BYTES:
+                return None
+            filename = ""
+            cd = r.headers.get("Content-Disposition", "")
+            m = re.search(r'filename\\*?=(?:UTF-8\\'\\')?["\\']?([^"\\';]+)', cd, re.I)
+            if m: filename = requests.utils.unquote(m.group(1))
+            if not filename: filename = os.path.basename(final.split("?",1)[0]) or "download.bin"
+            path = os.path.join(folder, safe_name(filename))
+            total = 0
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(CHUNK):
+                    if not chunk: continue
+                    total += len(chunk)
+                    if total > MAX_DOWNLOAD_BYTES:
+                        return None
+                    f.write(chunk)
+            return path if total else None
+    except Exception:
         return None
-    url = match.group(0).rstrip(".,!?)]}")
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme != "https" or host not in ALLOWED_HOSTS:
-        return None
-    if parsed.username or parsed.password:
-        return None
-    return url
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.send_message(
-        message.chat.id,
-        "✨ WELCOME TO ANYCONTENT DOWNLOADER ✨\n\n"
-        "Send a supported public YouTube, Instagram, or Facebook link.\n\n"
-        "✅ YouTube videos & Shorts\n"
-        "✅ Instagram Reels, videos, image posts & supported carousels\n"
-        "✅ Facebook Reels, videos, photo posts & supported albums\n"
-        "ℹ️ Stories and some posts may require access that is not available to this bot.\n\n"
-        "Download only content you own or have permission to save, and follow platform rules.",
-        reply_markup=main_keyboard()
-    )
-
-@bot.message_handler(commands=["help"])
-def help_command(message):
-    bot.reply_to(
-        message,
-        "Send a public HTTPS link from YouTube, Instagram, or Facebook. "
-        "The bot tries video extraction first, then image/gallery extraction. "
-        "Private, expired, login-protected, or unsupported links may fail."
-    )
-
-# ---------------- DOWNLOADERS ----------------
-def download_with_ytdlp(url, job_dir):
-    """Try video/media extraction using yt-dlp. Returns downloaded file paths."""
-    template = str(job_dir / "%(autonumber)03d_%(id)s.%(ext)s")
-    options = {
-        "outtmpl": template,
-        "format": "best[ext=mp4][filesize<49M]/best[filesize<49M]/best",
-        "noplaylist": False,
-        "playlistend": MAX_MEDIA_PER_JOB,
-        "max_filesize": MAX_FILE_SIZE,
-        "socket_timeout": 25,
-        "retries": 2,
-        "fragment_retries": 2,
-        "quiet": True,
-        "no_warnings": True,
-        "restrictfilenames": True,
-        "overwrites": False,
-        "ignoreerrors": True,
+def ytdlp_download(url, folder):
+    opts = {
+        "outtmpl": os.path.join(folder, "%(title).120B-%(id)s.%(ext)s"),
+        "format": "best[ext=mp4]/best",
+        "noplaylist": True, "quiet": True, "no_warnings": True,
+        "retries": 2, "socket_timeout": 25, "max_filesize": MAX_DOWNLOAD_BYTES,
     }
-    with yt_dlp.YoutubeDL(options) as downloader:
-        downloader.extract_info(url, download=True)
-    return [p for p in job_dir.rglob("*") if p.is_file() and p.stat().st_size > 0]
-
-def download_with_gallery_dl(url, job_dir):
-    """Fallback for image posts/carousels and supported galleries."""
-    executable = shutil.which("gallery-dl")
-    if not executable:
-        raise RuntimeError("gallery-dl is not installed")
-    # Keep output within this job's temporary folder.
-    result = subprocess.run(
-        [executable, "--destination", str(job_dir), url],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=150
-    )
-    files = [p for p in job_dir.rglob("*") if p.is_file() and p.stat().st_size > 0]
-    if not files:
-        detail = (result.stderr or result.stdout or "No media returned")[-700:]
-        raise RuntimeError(f"gallery-dl could not retrieve media: {detail}")
-    return files
-
-def download_media(url, job_dir):
-    errors = []
     try:
-        files = download_with_ytdlp(url, job_dir)
-        files = [p for p in files if p.is_file() and p.stat().st_size > 0]
-        if files:
-            return files[:MAX_MEDIA_PER_JOB]
-    except Exception as exc:
-        logger.warning("yt-dlp failed: %s", exc)
-        errors.append(str(exc))
-
-    # Clean partial files before trying the gallery/image downloader.
-    for p in list(job_dir.rglob("*")):
-        if p.is_file():
-            try:
-                p.unlink()
-            except OSError:
-                pass
-    try:
-        files = download_with_gallery_dl(url, job_dir)
-        return files[:MAX_MEDIA_PER_JOB]
-    except Exception as exc:
-        logger.warning("gallery-dl failed: %s", exc)
-        errors.append(str(exc))
-    raise RuntimeError("Both download methods failed. " + " | ".join(errors)[-900:])
-
-def is_image(path):
-    return path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
-
-def is_video(path):
-    return path.suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
-
-def send_downloaded_files(chat_id, files, status):
-    valid = []
-    for path in files:
-        try:
-            if path.is_file() and 0 < path.stat().st_size <= MAX_FILE_SIZE:
-                valid.append(path)
-        except OSError:
-            continue
-
-    if not valid:
-        raise RuntimeError("No media file under the Telegram 49 MB upload limit was found.")
-
-    valid = valid[:MAX_MEDIA_PER_JOB]
-    try:
-        bot.edit_message_text("⬆️ Uploading media...", status.chat.id, status.message_id)
+        with yt_dlp.YoutubeDL(opts) as ydl: ydl.download([url])
+        files = [p for p in glob.glob(os.path.join(folder, "*")) if os.path.isfile(p)]
+        return max(files, key=os.path.getsize) if files else None
     except Exception:
-        pass
+        return None
 
-    # Telegram media groups support photos/videos. Send groups in batches of at most 10.
-    if len(valid) > 1 and all(is_image(p) or is_video(p) for p in valid):
-        media = []
-        opened = []
-        try:
-            for index, path in enumerate(valid):
-                fh = path.open("rb")
-                opened.append(fh)
-                caption = CAPTION if index == 0 else None
-                if is_image(path):
-                    media.append(InputMediaPhoto(fh, caption=caption))
-                elif is_video(path):
-                    media.append(InputMediaVideo(fh, caption=caption, supports_streaming=True))
-                else:
-                    raise RuntimeError("Unsupported file type in media group.")
-            bot.send_media_group(chat_id, media, timeout=180)
-            return
-        finally:
-            for fh in opened:
-                fh.close()
+def gallery_download(url, folder):
+    try:
+        subprocess.run([sys.executable, "-m", "gallery_dl", "-D", folder, url],
+                       capture_output=True, text=True, timeout=180)
+        files = [p for p in glob.glob(os.path.join(folder, "**", "*"), recursive=True) if os.path.isfile(p)]
+        return files[:10]
+    except Exception:
+        return []
 
-    # One file at a time, including mixed media or document-like files.
-    for index, path in enumerate(valid):
-        caption = CAPTION if index == 0 else None
-        with path.open("rb") as fh:
-            if is_image(path):
-                bot.send_photo(chat_id, fh, caption=caption, timeout=180)
-            elif is_video(path):
-                bot.send_video(chat_id, fh, caption=caption, supports_streaming=True, timeout=180)
-            else:
-                bot.send_document(chat_id, fh, caption=caption, timeout=180)
+def send_path(message, path, url):
+    if os.path.getsize(path) > MAX_SEND_BYTES:
+        fallback(message.chat.id, url, "ফাইলটি 49 MB-এর বেশি। Telegram Bot API-তে সাধারণ আপলোড সীমা 50 MB।")
+        return
+    try:
+        with open(path, "rb") as f:
+            bot.send_document(message.chat.id, f, visible_file_name=safe_name(path),
+                              caption=f"✅ Downloaded Successfully!\nPower by: @{OWNER_USERNAME}", timeout=180)
+    except Exception:
+        fallback(message.chat.id, url, "ফাইলটি Telegram-এ পাঠানো যায়নি।")
 
-# ---------------- LINK HANDLER ----------------
-@bot.message_handler(content_types=["text"], func=lambda message: not (message.text or "").startswith("/"))
+@bot.message_handler(commands=["start", "help"])
+def start(message):
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📢 Subscribe Channel", url="https://youtube.com/@bubiloworld_1m?feature=shared"))
+    if TUTORIALS_URL: kb.add(InlineKeyboardButton("📚 All Tutorials", url=TUTORIALS_URL))
+    if OWNER_USERNAME: kb.add(InlineKeyboardButton("👤 Contact Owner", url=f"https://t.me/{OWNER_USERNAME}"))
+    bot.send_message(message.chat.id,
+        "👋 <b>Anycontent Downloader Bot</b>\n\n"
+        "একটি public link পাঠাও। বট যতটা পারবে ফাইল ডাউনলোড করে Telegram-এ পাঠাবে। "
+        "না পারলে মূল লিংক দেওয়ার চেষ্টা করবে।\n\n"
+        "সমর্থন সাইটভেদে আলাদা; login/private link নাও চলতে পারে। শুধু নিজের বা ডাউনলোডের অনুমতি থাকা ফাইল ব্যবহার করো।",
+        reply_markup=kb)
+
+@bot.message_handler(func=lambda m: bool(URL_RE.search(m.text or "")), content_types=["text"])
 def handle_link(message):
-    url = extract_valid_url(message.text)
-    if not url:
-        bot.reply_to(message, "❌ Send a valid HTTPS link from YouTube, Instagram, or Facebook.")
-        return
-
-    status = bot.reply_to(message, "🔍 Analyzing link...")
-    if not download_slots.acquire(blocking=False):
-        bot.edit_message_text("⏳ The bot is busy. Please try again shortly.", status.chat.id, status.message_id)
-        return
-
-    job_dir = DOWNLOAD_DIR / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=True)
+    url = URL_RE.search(message.text).group(0).rstrip(".,);]")
+    status = bot.reply_to(message, "🔎 লিংক পরীক্ষা করছি…")
+    folder = tempfile.mkdtemp(prefix="downloader_")
     try:
-        bot.edit_message_text("⬇️ Downloading media. Please wait...", status.chat.id, status.message_id)
-        files = download_media(url, job_dir)
-        send_downloaded_files(message.chat.id, files, status)
-        try:
-            bot.edit_message_text("✅ Finished! Check the media sent above.", status.chat.id, status.message_id)
-        except Exception:
-            pass
+        path = ytdlp_download(url, folder)
+        if not path:
+            files = gallery_download(url, folder)
+            path = files[0] if files else None
+        if not path:
+            path = direct_download(url, folder)
+        if path and os.path.isfile(path):
+            send_path(message, path, url)
+        else:
+            fallback(message.chat.id, url, "এই লিংকটি বট দিয়ে সরাসরি ডাউনলোড করা যায়নি বা সাইটটি সমর্থিত নয়।")
     except Exception:
-        logger.exception("Download job failed")
-        try:
-            bot.edit_message_text(
-                "❌ Could not download this link.\n\n"
-                "The post may be private, expired, login-protected, unsupported, or larger than 49 MB. "
-                "Try another public link. Check Render Logs for the technical error.",
-                status.chat.id, status.message_id
-            )
-        except Exception:
-            pass
+        fallback(message.chat.id, url, "ডাউনলোডের সময় সমস্যা হয়েছে।")
     finally:
-        shutil.rmtree(job_dir, ignore_errors=True)
-        download_slots.release()
+        try: bot.delete_message(message.chat.id, status.message_id)
+        except Exception: pass
+        shutil.rmtree(folder, ignore_errors=True)
 
-# ---------------- RUN ----------------
+@bot.message_handler(func=lambda m: True, content_types=["text"])
+def help_text(message):
+    bot.reply_to(message, "একটি public URL পাঠাও।")
+
 if __name__ == "__main__":
-    threading.Thread(target=keep_alive, daemon=True).start()
-    logger.info("Anycontent Downloader Bot is starting...")
+    Thread(target=keep_alive, daemon=True).start()
     bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+                              
